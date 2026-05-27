@@ -1,0 +1,68 @@
+name: AIS Collector — 24/7
+
+on:
+  schedule:
+    - cron: '0 */5 * * *'   # every 5 hours
+  workflow_dispatch:          # manual trigger from GitHub UI
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 290      # 4h 50min — safely under GitHub's 6h job limit
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install --no-cache-dir -r requirements.txt
+
+      # Restore the rolling AIS database from the previous run
+      - name: Restore AIS database
+        uses: actions/cache/restore@v4
+        with:
+          path: ais_history.db
+          key: ais-db-${{ github.run_id }}
+          restore-keys: |
+            ais-db-
+
+      - name: Show DB status
+        run: |
+          if [ -f ais_history.db ]; then
+            SIZE=$(du -sh ais_history.db | cut -f1)
+            echo "Restored ais_history.db — size: $SIZE"
+          else
+            echo "No existing DB — starting fresh"
+          fi
+
+      # Run collector for 4h 45min then gracefully stop (timeout sends SIGTERM)
+      - name: Run AIS collector
+        timeout-minutes: 285
+        env:
+          AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
+        run: |
+          python ais_collector.py collect \
+            --aois strait_of_malacca,strait_of_hormuz,gulf_of_aden,gulf_of_kutch,english_channel,dover_strait \
+          || true   # exit 0 even on timeout/SIGTERM so next steps run
+
+      - name: Show DB stats after run
+        if: always()
+        run: |
+          if [ -f ais_history.db ]; then
+            SIZE=$(du -sh ais_history.db | cut -f1)
+            ROWS=$(python -c "import sqlite3; c=sqlite3.connect('ais_history.db'); print(c.execute('SELECT COUNT(*) FROM positions').fetchone()[0])" 2>/dev/null || echo "?")
+            echo "DB size: $SIZE   Records: $ROWS"
+          fi
+
+      # Save DB so the next run can restore it
+      - name: Save AIS database
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ais_history.db
+          key: ais-db-${{ github.run_id }}

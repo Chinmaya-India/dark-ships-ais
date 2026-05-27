@@ -1,0 +1,91 @@
+{
+  "aois": [
+    {
+      "name": "strait_of_malacca",
+      "display_name": "Strait of Malacca",
+      "bbox": [99.0, 0.5, 104.5, 6.5],
+      "alert_threshold": 0.6,
+      "geofenced_zones": ["MPA_MALACCA_STRAIT"]
+    },
+    {
+      "name": "strait_of_hormuz",
+      "display_name": "Strait of Hormuz",
+      "bbox": [55.5, 24.0, 60.0, 27.5],
+      "alert_threshold": 0.65,
+      "geofenced_zones": ["EEZ_IRAN", "EEZ_OMAN"]
+    },
+    {
+      "name": "english_channel",
+      "display_name": "English Channel (Dover Strait)",
+      "bbox": [-1.5, 50.0, 2.5, 51.6],
+      "alert_threshold": 0.7,
+      "geofenced_zones": ["TSS_DOVER"]
+    },
+    {
+      "name": "dover_strait",
+      "display_name": "Dover Strait — TSS Shipping Lane",
+      "bbox": [0.5, 50.8, 2.5, 51.4],
+      "alert_threshold": 0.7,
+      "geofenced_zones": ["TSS_DOVER"]
+    },
+    {
+      "name": "south_china_sea",
+      "display_name": "South China Sea",
+      "bbox": [109.0, 10.0, 118.0, 22.0],
+      "alert_threshold": 0.55,
+      "geofenced_zones": ["SCS_CONTESTED_ZONE"]
+    },
+    {
+      "name": "gulf_of_kutch",
+      "display_name": "Gulf of Kutch / Kandla",
+      "bbox": [68.0, 22.0, 70.5, 23.5],
+      "alert_threshold": 0.7,
+      "geofenced_zones": ["EEZ_INDIA", "TERRITORIAL_WATERS_IND_KUTCH"],
+      "nisar_available": true
+    },
+    {
+      "name": "india_coast",
+      "display_name": "Indian Coastal Defense Zone",
+      "bbox": [67.0, 6.0, 90.0, 24.5],
+      "alert_threshold": 0.75,
+      "geofenced_zones": ["EEZ_INDIA", "TERRITORIAL_WATERS_IND_KUTCH", "TERRITORIAL_WATERS_IND_MUMBAI"]
+    },
+    {
+      "name": "singapore_strait",
+      "display_name": "Singapore Strait",
+      "bbox": [103.4, 1.1, 104.1, 1.5],
+      "alert_threshold": 0.5,
+      "geofenced_zones": []
+    },
+    {
+      "name": "gulf_of_aden",
+      "display_name": "Gulf of Aden (Suez-Asia Corridor)",
+      "bbox": [43.0, 11.0, 46.0, 13.0],
+      "alert_threshold": 0.6,
+      "geofenced_zones": ["EEZ_YEMEN", "EEZ_SOMALIA", "EEZ_DJIBOUTI"],
+      "nisar_available": true
+    },
+    {
+      "name": "iris_dena_sinking",
+      "display_name": "IRIS Dena Sinking Zone — Indian Ocean (2026-03-04)",
+      "bbox": [79.5, 5.5, 81.0, 6.5],
+      "alert_threshold": 0.5,
+      "geofenced_zones": ["INDIAN_OCEAN_OPEN_SEA"],
+      "incident_date": "2026-03-04",
+      "incident_coords": [6.03, 80.18],
+      "notes": "Iranian frigate IRIS Dena torpedoed by USS Charlotte (USN Los Angeles-class SSN), 20nm south of Galle, Sri Lanka. First US submarine torpedo kill since WWII. 104 dead. Pre/post SAR comparison for oil slick forensics."
+    },
+    {
+      "name": "mumbai_approach",
+      "display_name": "Mumbai Outer Anchorage",
+      "bbox": [70.5, 18.0, 73.5, 21.0],
+      "alert_threshold": 0.65,
+      "geofenced_zones": ["EEZ_INDIA", "MUMBAI_VTS_ZONE"],
+      "nisar_available": true
+    }
+  ],
+  "polling_interval_hours": 6,
+  "s2_sync_window_days": 3,
+  "sts_proximity_m": 500,
+  "spoof_speed_threshold_knots": 25
+}
