@@ -66,3 +66,15 @@ jobs:
         with:
           path: ais_history.db
           key: ais-db-${{ github.run_id }}
+
+      # Upload DB as a downloadable artifact so the local SAR pipeline
+      # can fetch it via: gh run download --name ais-database
+      # overwrite=true keeps only the latest copy (no storage bloat)
+      - name: Upload AIS database artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ais-database
+          path: ais_history.db
+          retention-days: 2
+          overwrite: true
