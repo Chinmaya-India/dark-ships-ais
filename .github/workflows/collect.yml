@@ -40,15 +40,19 @@ jobs:
             echo "No existing DB — starting fresh"
           fi
 
-      # Run collector for 4h 45min then gracefully stop (timeout sends SIGTERM)
+      # Run collector for 4h 45min then gracefully stop.
+      # NOTE: do NOT use step-level `timeout-minutes` here — GitHub marks the
+      # step (and run) as "failure" whenever that fires, even with `|| true`.
+      # Using shell-level `timeout --preserve-status` lets the step exit 0
+      # cleanly when the time budget expires, so the workflow stays green.
       - name: Run AIS collector
-        timeout-minutes: 285
         env:
           AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
         run: |
-          python ais_collector.py collect \
-            --aois strait_of_malacca,strait_of_hormuz,gulf_of_aden,gulf_of_kutch,english_channel,dover_strait \
-          || true   # exit 0 even on timeout/SIGTERM so next steps run
+          timeout --preserve-status --signal=SIGTERM 285m \
+            python ais_collector.py collect \
+              --aois strait_of_malacca,strait_of_hormuz,gulf_of_aden,gulf_of_kutch,english_channel,dover_strait \
+          || true   # SIGTERM exits 143, but cache+upload should still run
 
       - name: Show DB stats after run
         if: always()
