@@ -1,14 +1,14 @@
-name: AIS Collector — 24/7
+name: AIS Collector - 24/7
 
 on:
   schedule:
-    - cron: '0 */5 * * *'   # every 5 hours
+    - cron: "0 */5 * * *"   # every 5 hours
   workflow_dispatch:          # manual trigger from GitHub UI
 
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 290      # 4h 50min — safely under GitHub 6h job limit
+    timeout-minutes: 290      # 4h 50min - safely under GitHub's 6h job limit
 
     steps:
       - name: Checkout
@@ -17,12 +17,12 @@ jobs:
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install --no-cache-dir -r requirements.txt kaggle
+        run: pip install --no-cache-dir -r requirements.txt
 
-      # Restore rolling AIS database from previous run
+      # Restore the rolling AIS database from the previous run
       - name: Restore AIS database
         uses: actions/cache/restore@v4
         with:
@@ -35,20 +35,19 @@ jobs:
         run: |
           if [ -f ais_history.db ]; then
             SIZE=$(du -sh ais_history.db | cut -f1)
-            echo "Restored ais_history.db — size: $SIZE"
+            ROWS=$(python -c "import sqlite3; c=sqlite3.connect('ais_history.db'); print(c.execute('SELECT COUNT(*) FROM positions').fetchone()[0])" 2>/dev/null || echo "?")
+            echo "Restored ais_history.db - size: $SIZE, records: $ROWS"
           else
-            echo "No existing DB — starting fresh"
+            echo "No existing DB - starting fresh"
           fi
 
-      # Run collector for 4h 45min then gracefully stop
-      # AOIs: all 10 strategic areas covering Indian Ocean, SE Asia, Middle East, Europe
       - name: Run AIS collector
         env:
           AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
         run: |
           timeout --preserve-status --signal=SIGTERM 285m \
             python ais_collector.py collect \
-              --aois india_coast,gulf_of_kutch,mumbai_approach,strait_of_hormuz,gulf_of_aden,strait_of_malacca,singapore_strait,south_china_sea,english_channel,dover_strait \
+              --aois strait_of_malacca,strait_of_hormuz,gulf_of_aden,gulf_of_kutch,english_channel,dover_strait \
           || true
 
       - name: Show DB stats after run
@@ -56,42 +55,20 @@ jobs:
         run: |
           if [ -f ais_history.db ]; then
             SIZE=$(du -sh ais_history.db | cut -f1)
-            python - <<'PYEOF'
-          import sqlite3, datetime
-          c = sqlite3.connect('ais_history.db')
-          rows = c.execute('SELECT COUNT(*) FROM positions').fetchone()[0]
-          oldest = c.execute('SELECT MIN(ts) FROM positions').fetchone()[0]
-          newest = c.execute('SELECT MAX(ts) FROM positions').fetchone()[0]
-          oldest_str = datetime.datetime.utcfromtimestamp(oldest).strftime('%Y-%m-%d') if oldest else 'empty'
-          newest_str = datetime.datetime.utcfromtimestamp(newest).strftime('%Y-%m-%d %H:%M') if newest else 'empty'
-          # Per-AOI breakdown
-          try:
-              aoi_counts = c.execute('''
-                  SELECT aoi, COUNT(*) as cnt
-                  FROM positions
-                  GROUP BY aoi
-                  ORDER BY cnt DESC
-              ''').fetchall()
-              print(f"Records: {rows:,}  |  Oldest: {oldest_str}  |  Newest: {newest_str}")
-              print("Per-AOI breakdown:")
-              for aoi, cnt in aoi_counts:
-                  print(f"  {aoi or 'unknown'}: {cnt:,}")
-          except Exception:
-              print(f"Records: {rows:,}  |  Oldest: {oldest_str}  |  Newest: {newest_str}")
-          PYEOF
-            echo "DB size: $SIZE"
+            ROWS=$(python -c "import sqlite3; c=sqlite3.connect('ais_history.db'); print(c.execute('SELECT COUNT(*) FROM positions').fetchone()[0])" 2>/dev/null || echo "?")
+            echo "DB size: $SIZE   Records: $ROWS"
           fi
 
-      # Save DB so the next run can restore it (cache chains between runs)
-      - name: Save AIS database (cache)
+      # Save DB so the next run can restore it
+      - name: Save AIS database
         uses: actions/cache/save@v4
         if: always()
         with:
           path: ais_history.db
           key: ais-db-${{ github.run_id }}
 
-      # Push ais_history.db to Kaggle dataset — persistent storage + pipeline integration
-      # Detection notebooks on Kaggle can mount chinmayaupmanue/darkships-ais-history
+      # Push DB to Kaggle dataset for persistent 30-day rolling storage
+      # and for the Kaggle detection pipeline to mount as input
       - name: Push AIS database to Kaggle dataset
         if: always()
         env:
@@ -102,25 +79,19 @@ jobs:
             echo "No DB to push — skipping"
             exit 0
           fi
+          pip install kaggle --quiet
           mkdir -p kaggle_push
-          cp ais_history.db kaggle_push/ais_history.db
-          DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
-          ROWS=$(python -c "import sqlite3; c=sqlite3.connect('ais_history.db'); print(f\"{c.execute('SELECT COUNT(*) FROM positions').fetchone()[0]:,}\")" 2>/dev/null || echo "?")
-          SIZE=$(du -sh ais_history.db | cut -f1)
-          cat > kaggle_push/dataset-metadata.json <<METAEOF
-          {
-            "title": "darkships-ais-history",
-            "id": "chinmayaupmanue/darkships-ais-history",
-            "licenses": [{"name": "CC0-1.0"}]
-          }
-          METAEOF
+          cp ais_history.db kaggle_push/
+          printf '{"title":"darkships-ais-history","id":"chinmayaupmanue/darkships-ais-history","licenses":[{"name":"CC0-1.0"}]}' \
+            > kaggle_push/dataset-metadata.json
+          # Try version update first; fall back to create if dataset doesn't exist yet
           kaggle datasets version -p kaggle_push \
-            -m "AIS update ${DATE} | ${ROWS} records | ${SIZE}" \
+            -m "AIS update $(date -u +%Y-%m-%dT%H:%M) | $(python -c "import sqlite3; c=sqlite3.connect('ais_history.db'); print(c.execute('SELECT COUNT(*) FROM positions').fetchone()[0])" 2>/dev/null || echo '?') records" \
             --dir-mode zip \
-          || kaggle datasets create -p kaggle_push --dir-mode zip
-          echo "Kaggle push complete — ${ROWS} records (${SIZE})"
+          || kaggle datasets create -p kaggle_push --dir-mode zip \
+          || echo "WARNING: Kaggle push failed - DB is safe in GitHub cache"
 
-      # 90-day artifact as secondary backup
+      # Upload DB as artifact — 90 days retention as secondary backup
       - name: Upload AIS database artifact
         uses: actions/upload-artifact@v4
         if: always()
