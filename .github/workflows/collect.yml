@@ -1,14 +1,14 @@
-name: AIS Collector — 24/7
+name: AIS Collector -- 24/7
 
 on:
   schedule:
-    - cron: '0 */5 * * *'   # every 5 hours
-  workflow_dispatch:          # manual trigger from GitHub UI
+    - cron: "0 */5 * * *"   # every 5 hours
+  workflow_dispatch:
 
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 290      # 4h 50min — safely under GitHub's 6h job limit
+    timeout-minutes: 300
 
     steps:
       - name: Checkout
@@ -17,13 +17,14 @@ jobs:
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install --no-cache-dir -r requirements.txt
+        run: |
+          pip install --no-cache-dir -r requirements.txt
+          pip install --no-cache-dir kaggle
 
-      # Restore the rolling AIS database from the previous run
-      - name: Restore AIS database
+      - name: Restore AIS database from cache
         uses: actions/cache/restore@v4
         with:
           path: ais_history.db
@@ -31,20 +32,34 @@ jobs:
           restore-keys: |
             ais-db-
 
-      - name: Show DB status
+      - name: Restore AIS database from Kaggle (cache miss fallback)
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: |
+          if [ ! -f ais_history.db ]; then
+            mkdir -p /tmp/ais_dl
+            kaggle datasets download chinmayaupmanue/darkships-ais-history -p /tmp/ais_dl --unzip || true
+            if [ -f /tmp/ais_dl/ais_history.db ]; then
+              cp /tmp/ais_dl/ais_history.db ./ais_history.db
+              echo "Restored from Kaggle dataset"
+            else
+              echo "No Kaggle backup -- starting fresh"
+            fi
+          else
+            echo "Cache hit -- skipping Kaggle restore"
+          fi
+
+      - name: Show DB status before run
         run: |
           if [ -f ais_history.db ]; then
             SIZE=$(du -sh ais_history.db | cut -f1)
-            echo "Restored ais_history.db — size: $SIZE"
+            ROWS=$(python -c "import sqlite3; c=sqlite3.connect('ais_history.db'); print(c.execute('SELECT COUNT(*) FROM positions').fetchone()[0])" 2>/dev/null || echo "?")
+            echo "Restored ais_history.db -- size: $SIZE  Records: $ROWS"
           else
-            echo "No existing DB — starting fresh"
+            echo "No existing DB -- starting fresh"
           fi
 
-      # Run collector for 4h 45min then gracefully stop.
-      # NOTE: do NOT use step-level `timeout-minutes` here — GitHub marks the
-      # step (and run) as "failure" whenever that fires, even with `|| true`.
-      # Using shell-level `timeout --preserve-status` lets the step exit 0
-      # cleanly when the time budget expires, so the workflow stays green.
       - name: Run AIS collector
         env:
           AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
@@ -52,7 +67,7 @@ jobs:
           timeout --preserve-status --signal=SIGTERM 285m \
             python ais_collector.py collect \
               --aois strait_of_malacca,strait_of_hormuz,gulf_of_aden,gulf_of_kutch,english_channel,dover_strait \
-          || true   # SIGTERM exits 143, but cache+upload should still run
+          || true
 
       - name: Show DB stats after run
         if: always()
@@ -60,25 +75,40 @@ jobs:
           if [ -f ais_history.db ]; then
             SIZE=$(du -sh ais_history.db | cut -f1)
             ROWS=$(python -c "import sqlite3; c=sqlite3.connect('ais_history.db'); print(c.execute('SELECT COUNT(*) FROM positions').fetchone()[0])" 2>/dev/null || echo "?")
-            echo "DB size: $SIZE   Records: $ROWS"
+            OLDEST=$(python -c "import sqlite3,datetime; c=sqlite3.connect('ais_history.db'); r=c.execute('SELECT MIN(ts) FROM positions').fetchone()[0]; print(datetime.datetime.utcfromtimestamp(r).strftime('%Y-%m-%d') if r else 'empty')" 2>/dev/null || echo "?")
+            NEWEST=$(python -c "import sqlite3,datetime; c=sqlite3.connect('ais_history.db'); r=c.execute('SELECT MAX(ts) FROM positions').fetchone()[0]; print(datetime.datetime.utcfromtimestamp(r).strftime('%Y-%m-%d') if r else 'empty')" 2>/dev/null || echo "?")
+            echo "DB size: $SIZE  Records: $ROWS  Window: $OLDEST to $NEWEST"
           fi
 
-      # Save DB so the next run can restore it
-      - name: Save AIS database
+      - name: Push AIS database to Kaggle dataset
+        if: always()
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: |
+          mkdir -p /tmp/ais_push
+          cp ais_history.db /tmp/ais_push/ais_history.db
+          DATE=$(date -u +%Y-%m-%dT%H:%M)
+          ROWS=$(python -c "import sqlite3; c=sqlite3.connect('ais_history.db'); print(c.execute('SELECT COUNT(*) FROM positions').fetchone()[0])" 2>/dev/null || echo "?")
+          cat > /tmp/ais_push/dataset-metadata.json << EOF
+          {"title":"darkships-ais-history","id":"chinmayaupmanue/darkships-ais-history","licenses":[{"name":"CC0-1.0"}]}
+          EOF
+          kaggle datasets version -p /tmp/ais_push -m "AIS ${DATE} -- ${ROWS} records" --dir-mode zip \
+            || kaggle datasets create -p /tmp/ais_push --dir-mode zip \
+            || echo "WARNING: Kaggle push failed -- DB preserved in cache+artifact"
+
+      - name: Save AIS database to cache
         uses: actions/cache/save@v4
         if: always()
         with:
           path: ais_history.db
           key: ais-db-${{ github.run_id }}
 
-      # Upload DB as a downloadable artifact so the local SAR pipeline
-      # can fetch it via: gh run download --name ais-database
-      # overwrite=true keeps only the latest copy (no storage bloat)
       - name: Upload AIS database artifact
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ais-database
           path: ais_history.db
-          retention-days: 2
+          retention-days: 90
           overwrite: true
