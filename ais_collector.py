@@ -42,7 +42,7 @@ log = logging.getLogger("ais_collector")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [AIS_COL] %(message)s")
 
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "ais_history.db"))
-RETENTION_DAYS = 30
+RETENTION_DAYS = 90
 
 # ---------------------------------------------------------------------------
 # Database
