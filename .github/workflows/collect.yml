@@ -41,13 +41,14 @@ jobs:
           fi
 
       # Run collector for 4h 45min then gracefully stop
+      # AOIs: all 10 strategic areas covering Indian Ocean, SE Asia, Middle East, Europe
       - name: Run AIS collector
         env:
           AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
         run: |
           timeout --preserve-status --signal=SIGTERM 285m \
             python ais_collector.py collect \
-              --aois strait_of_malacca,strait_of_hormuz,gulf_of_aden,gulf_of_kutch,english_channel,dover_strait \
+              --aois india_coast,gulf_of_kutch,mumbai_approach,strait_of_hormuz,gulf_of_aden,strait_of_malacca,singapore_strait,south_china_sea,english_channel,dover_strait \
           || true
 
       - name: Show DB stats after run
@@ -60,10 +61,23 @@ jobs:
           c = sqlite3.connect('ais_history.db')
           rows = c.execute('SELECT COUNT(*) FROM positions').fetchone()[0]
           oldest = c.execute('SELECT MIN(ts) FROM positions').fetchone()[0]
-          oldest_str = datetime.datetime.utcfromtimestamp(oldest).strftime('%Y-%m-%d') if oldest else 'empty'
           newest = c.execute('SELECT MAX(ts) FROM positions').fetchone()[0]
+          oldest_str = datetime.datetime.utcfromtimestamp(oldest).strftime('%Y-%m-%d') if oldest else 'empty'
           newest_str = datetime.datetime.utcfromtimestamp(newest).strftime('%Y-%m-%d %H:%M') if newest else 'empty'
-          print(f"Records: {rows:,}  |  Oldest: {oldest_str}  |  Newest: {newest_str}")
+          # Per-AOI breakdown
+          try:
+              aoi_counts = c.execute('''
+                  SELECT aoi, COUNT(*) as cnt
+                  FROM positions
+                  GROUP BY aoi
+                  ORDER BY cnt DESC
+              ''').fetchall()
+              print(f"Records: {rows:,}  |  Oldest: {oldest_str}  |  Newest: {newest_str}")
+              print("Per-AOI breakdown:")
+              for aoi, cnt in aoi_counts:
+                  print(f"  {aoi or 'unknown'}: {cnt:,}")
+          except Exception:
+              print(f"Records: {rows:,}  |  Oldest: {oldest_str}  |  Newest: {newest_str}")
           PYEOF
             echo "DB size: $SIZE"
           fi
@@ -92,6 +106,7 @@ jobs:
           cp ais_history.db kaggle_push/ais_history.db
           DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
           ROWS=$(python -c "import sqlite3; c=sqlite3.connect('ais_history.db'); print(f\"{c.execute('SELECT COUNT(*) FROM positions').fetchone()[0]:,}\")" 2>/dev/null || echo "?")
+          SIZE=$(du -sh ais_history.db | cut -f1)
           cat > kaggle_push/dataset-metadata.json <<METAEOF
           {
             "title": "darkships-ais-history",
@@ -100,10 +115,10 @@ jobs:
           }
           METAEOF
           kaggle datasets version -p kaggle_push \
-            -m "AIS update ${DATE} | ${ROWS} records" \
+            -m "AIS update ${DATE} | ${ROWS} records | ${SIZE}" \
             --dir-mode zip \
           || kaggle datasets create -p kaggle_push --dir-mode zip
-          echo "Kaggle dataset push complete — ${ROWS} records"
+          echo "Kaggle push complete — ${ROWS} records (${SIZE})"
 
       # 90-day artifact as secondary backup
       - name: Upload AIS database artifact
