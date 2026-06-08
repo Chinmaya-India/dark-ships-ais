@@ -327,19 +327,31 @@ def run_collector(aoi_names: List[str]):
         log.error("AISSTREAM_API_KEY not set")
         sys.exit(1)
 
-    conn = _get_db()
-
     aoi_map = {a["name"]: a for a in aoi_config.get("aois", [])}
+
+    # Each coroutine gets its own SQLite connection — sharing one connection
+    # across concurrent asyncio tasks causes lock contention and silent data loss.
+    # Stagger WebSocket opens by 12s to avoid simultaneous HTTP 429 from AisStream.
+    STAGGER_S = 12
+
+    async def _staggered(bbox, delay):
+        if delay:
+            await asyncio.sleep(delay)
+        conn = _get_db()
+        try:
+            await _collect_loop(bbox, api_key, conn)
+        finally:
+            conn.close()
 
     async def _all():
         tasks = []
-        for name in aoi_names:
+        for i, name in enumerate(aoi_names):
             if name not in aoi_map:
                 log.warning(f"AOI '{name}' not in aoi_config.json — skipping")
                 continue
             bbox = aoi_map[name]["bbox"]
-            log.info(f"Collecting AIS for {name} bbox={bbox}")
-            tasks.append(_collect_loop(bbox, api_key, conn))
+            log.info(f"Collecting AIS for {name} bbox={bbox} (start delay={i*STAGGER_S}s)")
+            tasks.append(_staggered(bbox, i * STAGGER_S))
         if not tasks:
             log.error("No valid AOIs to collect")
             return
@@ -357,7 +369,6 @@ def run_collector(aoi_names: List[str]):
     try:
         loop.run_until_complete(_all())
     finally:
-        conn.close()
         loop.close()
 
 
