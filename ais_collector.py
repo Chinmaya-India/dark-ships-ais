@@ -96,11 +96,11 @@ def query_ais_snapshot(
     window_hours: float = 3.0,
 ) -> List[Dict]:
     """
-    Return all vessel positions within bbox in ±window_hours around acq_time.
+    Return all vessel positions within bbox in +-window_hours around acq_time.
     bbox = [min_lon, min_lat, max_lon, max_lat]
     """
     if not os.path.exists(DB_PATH):
-        log.warning("ais_history.db not found — no local AIS data yet")
+        log.warning("ais_history.db not found -- no local AIS data yet")
         return []
 
     min_lon, min_lat, max_lon, max_lat = bbox
@@ -139,7 +139,7 @@ def query_ais_snapshot(
             }
 
     vessels = list(seen.values())
-    log.info(f"[DB] {len(vessels)} unique vessels in bbox ±{window_hours}h of {acq_time.isoformat()}")
+    log.info(f"[DB] {len(vessels)} unique vessels in bbox +-{window_hours}h of {acq_time.isoformat()}")
     return vessels
 
 
@@ -175,12 +175,12 @@ def check_ais_coverage(
     # If we see 0, it's a 100% confirmed data gap.
     if count == 0:
         return 0.0
-    
+
     return min(1.0, count / 5.0)  # Simple heuristic: 5+ vessels = "Healthy enough to attempt fusion"
 
 
 # ---------------------------------------------------------------------------
-# GFW 4Wings backfill (vessel presence — 2012 to 96h ago)
+# GFW 4Wings backfill (vessel presence -- 2012 to 96h ago)
 # ---------------------------------------------------------------------------
 
 def backfill_from_gfw(bbox: List[float], start: datetime, end: datetime) -> int:
@@ -194,7 +194,7 @@ def backfill_from_gfw(bbox: List[float], start: datetime, end: datetime) -> int:
     try:
         client = GFWClient()
     except ValueError as e:
-        log.warning(f"[GFW] {e} — skipping backfill")
+        log.warning(f"[GFW] {e} -- skipping backfill")
         return 0
 
     start_str = start.strftime("%Y-%m-%d")
@@ -238,7 +238,17 @@ def backfill_from_gfw(bbox: List[float], start: datetime, end: datetime) -> int:
 # ---------------------------------------------------------------------------
 
 async def _collect_loop(bbox: List[float], api_key: str, conn: sqlite3.Connection):
+    """
+    Inner loop: connect, stream, flush.  Reconnects indefinitely.
+
+    Reconnect strategy:
+    - Clean server close (ConnectionClosedOK): reconnect immediately, no backoff.
+    - Error / dirty close (ConnectionClosedError, OSError, etc.): exponential
+      backoff starting at 5s, capped at 120s.
+    - asyncio.CancelledError: propagated up so gather() can shut down cleanly.
+    """
     import websockets
+    from websockets.exceptions import ConnectionClosedOK, ConnectionClosed
 
     subscribe_msg = {
         "APIKey": api_key,
@@ -251,13 +261,29 @@ async def _collect_loop(bbox: List[float], api_key: str, conn: sqlite3.Connectio
     batch = []
     last_prune = time.time()
 
+    def _flush_batch():
+        if batch:
+            conn.executemany("""
+                INSERT INTO positions
+                (mmsi,ts,lat,lon,speed,course,name,ship_type,flag,source)
+                VALUES (:mmsi,:ts,:lat,:lon,:speed,:course,:name,:ship_type,:flag,:source)
+            """, batch)
+            conn.commit()
+            log.info(f"Flushed {len(batch)} positions to DB")
+            batch.clear()
+
     while True:
+        clean_close = False
         try:
             log.info(f"Connecting to AisStream ({bbox})...")
-            async with websockets.connect(url, ping_interval=20) as ws:
+            # ping_timeout=30: raises ConnectionClosedError if server stops
+            # responding to pings within 30s, preventing silent hangs.
+            async with websockets.connect(
+                url, ping_interval=20, ping_timeout=30
+            ) as ws:
                 await ws.send(json.dumps(subscribe_msg))
-                retry_delay = 5
-                log.info("AisStream connected")
+                retry_delay = 5  # reset on successful connect
+                log.info(f"AisStream connected ({bbox})")
 
                 async for raw in ws:
                     data = json.loads(raw)
@@ -288,32 +314,45 @@ async def _collect_loop(bbox: List[float], api_key: str, conn: sqlite3.Connectio
                         })
 
                     if len(batch) >= 500:
-                        conn.executemany("""
-                            INSERT INTO positions
-                            (mmsi,ts,lat,lon,speed,course,name,ship_type,flag,source)
-                            VALUES (:mmsi,:ts,:lat,:lon,:speed,:course,:name,:ship_type,:flag,:source)
-                        """, batch)
-                        conn.commit()
-                        log.info(f"Flushed {len(batch)} positions to DB")
-                        batch.clear()
+                        _flush_batch()
 
                     # Prune once per hour
                     if time.time() - last_prune > 3600:
                         _prune_old(conn)
                         last_prune = time.time()
 
-        except Exception as e:
-            log.warning(f"AisStream error: {e} — retry in {retry_delay}s")
-            if batch:
-                conn.executemany("""
-                    INSERT INTO positions
-                    (mmsi,ts,lat,lon,speed,course,name,ship_type,flag,source)
-                    VALUES (:mmsi,:ts,:lat,:lon,:speed,:course,:name,:ship_type,:flag,:source)
-                """, batch)
-                conn.commit()
-                batch.clear()
+            # async for exhausted without exception = server sent clean close frame
+            clean_close = True
+            _flush_batch()
+            log.info(f"AisStream closed cleanly -- reconnecting immediately ({bbox})")
+
+        except asyncio.CancelledError:
+            # Propagate cancellation so asyncio.gather() can shut down
+            _flush_batch()
+            raise
+
+        except ConnectionClosedOK:
+            # Some websockets versions raise this instead of exiting async for
+            clean_close = True
+            _flush_batch()
+            log.info(f"AisStream closed cleanly (ConnectionClosedOK) -- reconnecting ({bbox})")
+
+        except ConnectionClosed as e:
+            # Dirty close / error close: use backoff
+            _flush_batch()
+            log.warning(f"AisStream disconnected ({bbox}): {e} -- retry in {retry_delay}s")
             await asyncio.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 120)
+
+        except Exception as e:
+            _flush_batch()
+            log.warning(f"AisStream error ({bbox}): {e} -- retry in {retry_delay}s")
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 120)
+
+        if clean_close:
+            # No backoff on clean server-initiated close -- reconnect immediately
+            retry_delay = 5
 
 
 def run_collector(aoi_names: List[str]):
@@ -329,7 +368,7 @@ def run_collector(aoi_names: List[str]):
 
     aoi_map = {a["name"]: a for a in aoi_config.get("aois", [])}
 
-    # Each coroutine gets its own SQLite connection — sharing one connection
+    # Each coroutine gets its own SQLite connection -- sharing one connection
     # across concurrent asyncio tasks causes lock contention and silent data loss.
     # Stagger WebSocket opens by 12s to avoid simultaneous HTTP 429 from AisStream.
     STAGGER_S = 12
@@ -339,7 +378,20 @@ def run_collector(aoi_names: List[str]):
             await asyncio.sleep(delay)
         conn = _get_db()
         try:
-            await _collect_loop(bbox, api_key, conn)
+            # Outer resilience loop: if _collect_loop exits for any reason other
+            # than explicit cancellation, restart it after a brief pause rather
+            # than letting this task end and leave an AOI uncovered.
+            while True:
+                try:
+                    await _collect_loop(bbox, api_key, conn)
+                    # _collect_loop normally never returns -- log if it does
+                    log.warning(f"_collect_loop returned unexpectedly for {bbox} -- restarting in 10s")
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    raise  # shutdown signal -- propagate
+                except Exception as e:
+                    log.warning(f"Collector for {bbox} crashed: {e} -- restarting in 30s")
+                    await asyncio.sleep(30)
         finally:
             conn.close()
 
@@ -347,7 +399,7 @@ def run_collector(aoi_names: List[str]):
         tasks = []
         for i, name in enumerate(aoi_names):
             if name not in aoi_map:
-                log.warning(f"AOI '{name}' not in aoi_config.json — skipping")
+                log.warning(f"AOI '{name}' not in aoi_config.json -- skipping")
                 continue
             bbox = aoi_map[name]["bbox"]
             log.info(f"Collecting AIS for {name} bbox={bbox} (start delay={i*STAGGER_S}s)")
@@ -355,7 +407,11 @@ def run_collector(aoi_names: List[str]):
         if not tasks:
             log.error("No valid AOIs to collect")
             return
-        await asyncio.gather(*tasks)
+        # return_exceptions=True: one AOI crashing does NOT cancel the others
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for i, r in enumerate(results):
+            if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
+                log.error(f"AOI task {i} ended with error: {r}")
 
     loop = asyncio.new_event_loop()
 
@@ -381,14 +437,14 @@ def start_api_server(host: str = "0.0.0.0", port: int = 8080):
     Minimal Flask HTTP server so the local SAR pipeline can query the cloud DB.
 
     Endpoints:
-      GET /health                          → {"status":"ok","records":N}
-      GET /query?bbox=W,S,E,N&time=ISO8601 → JSON array of vessels
-      GET /stats                           → DB stats JSON
+      GET /health                          -- {"status":"ok","records":N}
+      GET /query?bbox=W,S,E,N&time=ISO8601 -- JSON array of vessels
+      GET /stats                           -- DB stats JSON
     """
     try:
         from flask import Flask, jsonify, request as freq
     except ImportError:
-        log.error("flask not installed — run: pip install flask")
+        log.error("flask not installed -- run: pip install flask")
         return
 
     app = Flask("ais-api")
@@ -476,7 +532,7 @@ if __name__ == "__main__":
     # stats
     sub.add_parser("stats", help="Show DB statistics")
 
-    # serve  — collect + HTTP API together (used in cloud deployment)
+    # serve  -- collect + HTTP API together (used in cloud deployment)
     p_srv = sub.add_parser("serve", help="Collect AIS + serve HTTP query API")
     p_srv.add_argument("--aois", required=True, help="Comma-separated AOI names")
     p_srv.add_argument("--port", type=int, default=8080, help="HTTP API port (default 8080)")
