@@ -2,13 +2,15 @@ name: AIS Collector - 24/7
 
 on:
   schedule:
-    - cron: "0 */5 * * *"
+    # Every hour at :05. Short 55-min runs ensure near-continuous coverage
+    # even when aisstream.io closes connections after ~1h.
+    - cron: "5 * * * *"
   workflow_dispatch:
 
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 290
+    timeout-minutes: 62
 
     steps:
       - name: Checkout
@@ -44,7 +46,7 @@ jobs:
         env:
           AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
         run: |
-          timeout --preserve-status --signal=SIGTERM 285m \
+          timeout --preserve-status --signal=SIGTERM 55m \
             python ais_collector.py collect \
               --aois strait_of_malacca,malacca_north,strait_of_hormuz,gulf_of_aden,gulf_of_kutch,english_channel,dover_strait \
           || true
@@ -65,6 +67,8 @@ jobs:
           path: ais_history.db
           key: ais-db-${{ github.run_id }}
 
+      # Push to Kaggle every 4 hours (at UTC 01, 05, 09, 13, 17, 21 past the hour).
+      # The cron fires at :05 each hour, so check if we're at a 4-hour boundary.
       # pin kaggle<2: v2.x dropped KAGGLE_USERNAME+KAGGLE_KEY env auth.
       # isPrivate:false makes the dataset public for collaborator access.
       - name: Push AIS database to Kaggle dataset
@@ -73,6 +77,11 @@ jobs:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
+          HOUR=$(date -u +%-H)
+          if [ $(( HOUR % 4 )) -ne 1 ]; then
+            echo "Skipping Kaggle push (hour=$HOUR, next push at hour $((  ((HOUR/4)+1)*4+1 )))"
+            exit 0
+          fi
           if [ ! -f ais_history.db ]; then
             echo "No DB to push -- skipping"
             exit 0
