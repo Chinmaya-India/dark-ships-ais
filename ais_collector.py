@@ -237,28 +237,93 @@ def backfill_from_gfw(bbox: List[float], start: datetime, end: datetime) -> int:
 # AisStream WebSocket collector
 # ---------------------------------------------------------------------------
 
-async def _collect_loop(bbox: List[float], api_key: str, conn: sqlite3.Connection):
+def _parse_ais_message(data: dict, static_cache: Dict[int, dict]) -> Optional[dict]:
     """
-    Inner loop: connect, stream, flush.  Reconnects indefinitely.
+    Parse one AisStream message into a position row, enriching it with vessel
+    identity (name + ship type) carried by ShipStaticData messages.
+
+    AisStream sends identity in a *separate* ShipStaticData message, not in the
+    PositionReport. We cache the latest {name, ship_type} per MMSI and stamp it
+    onto subsequent position rows for that vessel.
+
+    Field names per https://aisstream.io/documentation:
+      ShipStaticData.Name (str) · ShipStaticData.Type (int vessel-type code)
+      MMSI lives in MetaData.MMSI.  (The real field is "Type", NOT "ShipType".)
+    """
+    mmsi = data.get("MetaData", {}).get("MMSI")
+    if not mmsi:
+        return None
+
+    msg_type = data.get("MessageType")
+    content  = data.get("Message", {})
+
+    if msg_type == "ShipStaticData":
+        s  = content.get("ShipStaticData", {})
+        nm = (s.get("Name") or "").strip() or None
+        tp = s.get("Type")  # integer ITU vessel-type code
+        if nm is not None or tp is not None:
+            static_cache[mmsi] = {"name": nm, "ship_type": tp}
+        return None
+
+    if msg_type != "PositionReport":
+        return None
+
+    pos = content.get("PositionReport", {})
+    lat = pos.get("Latitude")
+    lon = pos.get("Longitude")
+    if lat is None or lon is None:
+        return None
+
+    ts_str = data.get("MetaData", {}).get("time_utc")
+    try:
+        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        ts = datetime.now(timezone.utc).timestamp()
+
+    ident = static_cache.get(mmsi, {})
+    return {
+        "mmsi": str(mmsi), "ts": ts,
+        "lat": lat, "lon": lon,
+        "speed": pos.get("Sog"), "course": pos.get("Cog"),
+        "name": ident.get("name"),
+        "ship_type": ident.get("ship_type"),
+        "flag": None,
+        "source": "aisstream",
+    }
+
+
+async def _collect_loop(bboxes: List[List[float]], api_key: str, conn: sqlite3.Connection):
+    """
+    Inner loop: ONE connection subscribing to ALL AOI bounding boxes; stream, flush.
+
+    Why one connection for everything: AisStream rejects multiple concurrent
+    WebSocket connections per API key with HTTP 429. Opening one connection per
+    AOI therefore starved all but the first few to connect (whichever won the
+    race) — Gulf of Kutch, Dover and others collected nothing. AisStream's
+    subscription accepts a *list* of BoundingBoxes, so a single connection
+    collects every AOI at once and sidesteps the limit entirely.
 
     Reconnect strategy:
     - Clean server close (ConnectionClosedOK): reconnect immediately, no backoff.
-    - Error / dirty close (ConnectionClosedError, OSError, etc.): exponential
-      backoff starting at 5s, capped at 120s.
-    - asyncio.CancelledError: propagated up so gather() can shut down cleanly.
+    - Error / dirty close: exponential backoff starting at 5s, capped at 120s.
+    - asyncio.CancelledError: propagated up for clean shutdown.
     """
     import websockets
     from websockets.exceptions import ConnectionClosedOK, ConnectionClosed
 
+    # bbox = [min_lon, min_lat, max_lon, max_lat];
+    # AisStream wants [[SW_lat, SW_lon], [NE_lat, NE_lon]] per box.
+    boxes = [[[b[1], b[0]], [b[3], b[2]]] for b in bboxes]
     subscribe_msg = {
         "APIKey": api_key,
-        "BoundingBoxes": [[[bbox[1], bbox[0]], [bbox[3], bbox[2]]]],
+        "BoundingBoxes": boxes,
         "FilterMessageTypes": ["PositionReport", "ShipStaticData"],
     }
 
     url = "wss://stream.aisstream.io/v0/stream"
     retry_delay = 5
     batch = []
+    static_cache: Dict[int, dict] = {}   # mmsi -> {name, ship_type} from ShipStaticData
     last_prune = time.time()
 
     def _flush_batch():
@@ -275,7 +340,7 @@ async def _collect_loop(bbox: List[float], api_key: str, conn: sqlite3.Connectio
     while True:
         clean_close = False
         try:
-            log.info(f"Connecting to AisStream ({bbox})...")
+            log.info(f"Connecting to AisStream ({len(boxes)} AOI bboxes, single connection)...")
             # ping_timeout=30: raises ConnectionClosedError if server stops
             # responding to pings within 30s, preventing silent hangs.
             async with websockets.connect(
@@ -283,35 +348,12 @@ async def _collect_loop(bbox: List[float], api_key: str, conn: sqlite3.Connectio
             ) as ws:
                 await ws.send(json.dumps(subscribe_msg))
                 retry_delay = 5  # reset on successful connect
-                log.info(f"AisStream connected ({bbox})")
+                log.info(f"AisStream connected -- {len(boxes)} AOIs on one connection")
 
                 async for raw in ws:
-                    data = json.loads(raw)
-                    mmsi = data.get("MetaData", {}).get("MMSI")
-                    if not mmsi:
-                        continue
-
-                    msg_type = data.get("MessageType")
-                    content  = data.get("Message", {})
-                    ts_str   = data.get("MetaData", {}).get("time_utc")
-                    try:
-                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
-                    except Exception:
-                        ts = datetime.now(timezone.utc).timestamp()
-
-                    if msg_type == "PositionReport":
-                        pos = content.get("PositionReport", {})
-                        lat = pos.get("Latitude")
-                        lon = pos.get("Longitude")
-                        if lat is None or lon is None:
-                            continue
-                        batch.append({
-                            "mmsi": str(mmsi), "ts": ts,
-                            "lat": lat, "lon": lon,
-                            "speed": pos.get("Sog"), "course": pos.get("Cog"),
-                            "name": None, "ship_type": None, "flag": None,
-                            "source": "aisstream",
-                        })
+                    row = _parse_ais_message(json.loads(raw), static_cache)
+                    if row is not None:
+                        batch.append(row)
 
                     if len(batch) >= 500:
                         _flush_batch()
@@ -324,10 +366,10 @@ async def _collect_loop(bbox: List[float], api_key: str, conn: sqlite3.Connectio
             # async for exhausted without exception = server sent clean close frame
             clean_close = True
             _flush_batch()
-            log.info(f"AisStream closed cleanly -- reconnecting immediately ({bbox})")
+            log.info("AisStream closed cleanly -- reconnecting immediately")
 
         except asyncio.CancelledError:
-            # Propagate cancellation so asyncio.gather() can shut down
+            # Propagate cancellation so the event loop can shut down
             _flush_batch()
             raise
 
@@ -335,18 +377,18 @@ async def _collect_loop(bbox: List[float], api_key: str, conn: sqlite3.Connectio
             # Some websockets versions raise this instead of exiting async for
             clean_close = True
             _flush_batch()
-            log.info(f"AisStream closed cleanly (ConnectionClosedOK) -- reconnecting ({bbox})")
+            log.info("AisStream closed cleanly (ConnectionClosedOK) -- reconnecting")
 
         except ConnectionClosed as e:
             # Dirty close / error close: use backoff
             _flush_batch()
-            log.warning(f"AisStream disconnected ({bbox}): {e} -- retry in {retry_delay}s")
+            log.warning(f"AisStream disconnected: {e} -- retry in {retry_delay}s")
             await asyncio.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 120)
 
         except Exception as e:
             _flush_batch()
-            log.warning(f"AisStream error ({bbox}): {e} -- retry in {retry_delay}s")
+            log.warning(f"AisStream error: {e} -- retry in {retry_delay}s")
             await asyncio.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 120)
 
@@ -368,50 +410,41 @@ def run_collector(aoi_names: List[str]):
 
     aoi_map = {a["name"]: a for a in aoi_config.get("aois", [])}
 
-    # Each coroutine gets its own SQLite connection -- sharing one connection
-    # across concurrent asyncio tasks causes lock contention and silent data loss.
-    # Stagger WebSocket opens by 12s to avoid simultaneous HTTP 429 from AisStream.
-    STAGGER_S = 12
+    # Collect the bounding boxes for all requested AOIs. ONE AisStream connection
+    # subscribes to all of them at once -- one connection per AOI exceeds the
+    # per-key concurrent-connection limit (HTTP 429) and starves whichever AOIs
+    # lose the race (which previously left Gulf of Kutch, Dover, etc. empty).
+    bboxes: List[List[float]] = []
+    for name in aoi_names:
+        if name not in aoi_map:
+            log.warning(f"AOI '{name}' not in aoi_config.json -- skipping")
+            continue
+        bbox = aoi_map[name]["bbox"]
+        bboxes.append(bbox)
+        log.info(f"Will collect AIS for {name} bbox={bbox}")
+    if not bboxes:
+        log.error("No valid AOIs to collect")
+        return
+    log.info(f"Opening ONE AisStream connection for {len(bboxes)} AOIs "
+             f"(single multi-bbox subscription -- avoids the per-key HTTP 429 limit)")
 
-    async def _staggered(bbox, delay):
-        if delay:
-            await asyncio.sleep(delay)
+    async def _all():
+        # One SQLite connection, one WebSocket. Outer loop restarts the collector
+        # if it ever exits for any reason other than explicit shutdown.
         conn = _get_db()
         try:
-            # Outer resilience loop: if _collect_loop exits for any reason other
-            # than explicit cancellation, restart it after a brief pause rather
-            # than letting this task end and leave an AOI uncovered.
             while True:
                 try:
-                    await _collect_loop(bbox, api_key, conn)
-                    # _collect_loop normally never returns -- log if it does
-                    log.warning(f"_collect_loop returned unexpectedly for {bbox} -- restarting in 10s")
+                    await _collect_loop(bboxes, api_key, conn)
+                    log.warning("_collect_loop returned unexpectedly -- restarting in 10s")
                     await asyncio.sleep(10)
                 except asyncio.CancelledError:
                     raise  # shutdown signal -- propagate
                 except Exception as e:
-                    log.warning(f"Collector for {bbox} crashed: {e} -- restarting in 30s")
+                    log.warning(f"Collector crashed: {e} -- restarting in 30s")
                     await asyncio.sleep(30)
         finally:
             conn.close()
-
-    async def _all():
-        tasks = []
-        for i, name in enumerate(aoi_names):
-            if name not in aoi_map:
-                log.warning(f"AOI '{name}' not in aoi_config.json -- skipping")
-                continue
-            bbox = aoi_map[name]["bbox"]
-            log.info(f"Collecting AIS for {name} bbox={bbox} (start delay={i*STAGGER_S}s)")
-            tasks.append(_staggered(bbox, i * STAGGER_S))
-        if not tasks:
-            log.error("No valid AOIs to collect")
-            return
-        # return_exceptions=True: one AOI crashing does NOT cancel the others
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for i, r in enumerate(results):
-            if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
-                log.error(f"AOI task {i} ended with error: {r}")
 
     loop = asyncio.new_event_loop()
 
